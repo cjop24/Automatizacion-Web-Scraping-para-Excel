@@ -21,17 +21,17 @@ def run_scraper():
     password = os.getenv("PQRD_PASS")
     
     driver = webdriver.Chrome(options=chrome_options)
-    wait = WebDriverWait(driver, 40) # Aumentamos espera a 40 segundos
+    wait = WebDriverWait(driver, 45) # Mayor tolerancia para carga de datos
 
     try:
         # --- PASO 1: Login ---
-        print("Abriendo página de login...")
+        print("Accediendo a SuperArgo...")
         driver.get("https://pqrdsuperargo.supersalud.gov.co/login")
         
         wait.until(EC.presence_of_element_located((By.ID, "user"))).send_keys(user)
         driver.find_element(By.ID, "password").send_keys(password)
 
-        print("Intentando click en INGRESAR...")
+        print("Enviando formulario de acceso...")
         boton_js = """
         var botones = document.querySelectorAll('button');
         for (var i = 0; i < botones.length; i++) {
@@ -43,54 +43,21 @@ def run_scraper():
         return false;
         """
         driver.execute_script(boton_js)
-        time.sleep(10)
+        time.sleep(10) # Espera post-login
 
-        # --- PASO 2: Lectura de Excel ---
+        # --- PASO 2: Preparación de Excel ---
         file_path = "Reclamos.xlsx"
         df = pd.read_excel(file_path, engine='openpyxl')
 
-        # SOLUCIÓN AL INDEX ERROR: 
-        # Si el archivo no tiene 111 columnas, creamos la columna DG (índice 110)
+        # Asegurar que la columna DG (índice 110) exista
         while df.shape[1] <= 110:
-            df[f"Nueva_Columna_{df.shape[1]}"] = ""
+            df[f"Columna_Aux_{df.shape[1]}"] = ""
         
-        # Le ponemos nombre a la columna de destino si es necesario
         target_col = 110 # Columna DG
 
+        # --- PASO 3: Bucle de Extracción ---
         for index, row in df.iterrows():
             pqr_nurc = str(row.iloc[5]).strip()
             
             if not pqr_nurc or pqr_nurc == 'nan' or pqr_nurc == '':
-                break
-                
-            url_reclamo = f"https://pqrdsuperargo.supersalud.gov.co/gestion/supervisar/{pqr_nurc}"
-            print(f"Procesando NURC: {pqr_nurc}")
-            
-            driver.get(url_reclamo)
-            
-            try:
-                # PASO 2.3: Extraer Seguimiento
-                # Usamos un selector más genérico por si ID falla
-                seguimiento_elem = wait.until(EC.visibility_of_element_located((By.CSS_SELECTOR, "#main_table_wrapper, .dataTables_wrapper")))
-                df.iat[index, target_col] = seguimiento_elem.text
-                print(f"Datos extraídos para {pqr_nurc}")
-                
-            except TimeoutException:
-                print(f"Aviso: No se encontró tabla para {pqr_nurc}")
-                df.iat[index, target_col] = "Sin datos de seguimiento o error de carga"
-            
-            time.sleep(3)
-
-        # Guardar archivo final
-        df.to_excel("Reclamos_scraping.xlsx", index=False, engine='openpyxl')
-        print("Proceso finalizado con éxito.")
-
-    except Exception as e:
-        print(f"Ocurrió un error inesperado: {e}")
-        driver.save_screenshot("debug_error.png")
-        raise
-    finally:
-        driver.quit()
-
-if __name__ == "__main__":
-    run_scraper()
+                print(f"Fin de registros detectado en fila
