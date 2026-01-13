@@ -6,9 +6,8 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException
 
-# Configuración de Chrome para GitHub Actions
+# Configuración de Chrome optimizada para GitHub Actions
 chrome_options = Options()
 chrome_options.add_argument("--headless")
 chrome_options.add_argument("--no-sandbox")
@@ -17,6 +16,7 @@ chrome_options.add_argument("--window-size=1920,1080")
 chrome_options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
 def run_scraper():
+    # Recuperar credenciales de Secrets
     user = os.getenv("PQRD_USER")
     password = os.getenv("PQRD_PASS")
     
@@ -25,78 +25,81 @@ def run_scraper():
 
     try:
         # --- PASO 1: Login ---
-        print("Accediendo a SuperArgo...")
+        print("Iniciando sesión en SuperArgo...")
         driver.get("https://pqrdsuperargo.supersalud.gov.co/login")
         
         wait.until(EC.presence_of_element_located((By.ID, "user"))).send_keys(user)
         driver.find_element(By.ID, "password").send_keys(password)
 
-        print("Enviando formulario de acceso...")
-        boton_js = """
-        var botones = document.querySelectorAll('button');
-        for (var i = 0; i < botones.length; i++) {
-            if (botones[i].textContent.includes('INGRESAR')) {
-                botones[i].click();
-                return true;
-            }
-        }
-        return false;
-        """
+        # Click en INGRESAR mediante JS para evitar bloqueos de renderizado
+        boton_js = "var btn = document.querySelector('button.mat-flat-button'); if(btn) btn.click();"
         driver.execute_script(boton_js)
-        time.sleep(10)
+        time.sleep(10) # Tiempo para que cargue el sistema
 
-        # --- PASO 2: Preparación de Excel ---
+        # --- PASO 2: Lectura de Excel (EVITAR REDONDEO) ---
         file_path = "Reclamos.xlsx"
-        df = pd.read_excel(file_path, engine='openpyxl')
+        # Leemos todo como string para que no altere los NURC largos
+        df = pd.read_excel(file_path, engine='openpyxl', dtype=str)
 
-        # Asegurar columna DG (índice 110)
+        # Asegurar que la columna DG (índice 110) exista
         while df.shape[1] <= 110:
-            df[f"Columna_Extra_{df.shape[1]}"] = ""
+            df[f"Columna_Seguimiento_{df.shape[1]}"] = ""
         
         target_col = 110
 
         # --- PASO 3: Bucle de Extracción ---
         for index, row in df.iterrows():
-            pqr_nurc = str(row.iloc[5]).strip()
+            # Limpieza profunda del NURC (columna 6 / índice 5)
+            # Eliminamos espacios, posibles .0 de conversiones previas y lo tratamos como texto puro
+            pqr_nurc = str(row.iloc[5]).strip().split('.')[0]
             
-            # Verificación de celda vacía para detener el bucle
             if not pqr_nurc or pqr_nurc == 'nan' or pqr_nurc == '':
-                print(f"Fin de registros detectado en fila {index + 1}")
+                print(f"Llegamos al final de los datos en fila {index + 1}")
                 break
                 
             url_reclamo = f"https://pqrdsuperargo.supersalud.gov.co/gestion/supervisar/{pqr_nurc}"
-            print(f"Procesando NURC: {pqr_nurc}")
+            print(f"Extrayendo NURC: {pqr_nurc}")
+            
             driver.get(url_reclamo)
             
             try:
-                # Esperar que el contenedor exista
+                # Esperamos a que la tabla de seguimiento (main_table) aparezca
+                # Basado en Fotografía 2: #main_table_wrapper es el ID correcto
                 wait.until(EC.presence_of_element_located((By.ID, "main_table_wrapper")))
                 
-                # Scroll y espera de renderizado
+                # Scroll y pausa para que Angular pueble la tabla
                 driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                time.sleep(4) 
-
-                # Esperar hasta que la tabla tenga texto real (> 50 caracteres)
-                wait.until(lambda d: len(d.find_element(By.ID, "main_table_wrapper").text.strip()) > 50)
+                time.sleep(6) 
                 
-                seguimiento_data = driver.find_element(By.ID, "main_table_wrapper").text
-                df.iat[index, target_col] = seguimiento_data
+                # Capturamos el texto de la tabla
+                seguimiento_elem = driver.find_element(By.ID, "main_table_wrapper")
+                texto_final = seguimiento_elem.text.strip()
+
+                # Si el contenedor principal trae poco texto, intentamos con el tag table directamente
+                if len(texto_final) < 20:
+                    tablas = driver.find_elements(By.TAG_NAME, "table")
+                    if tablas:
+                        texto_final = tablas[-1].text.strip() # Usualmente la última tabla es la de seguimiento
+
+                df.iat[index, target_col] = texto_final
                 print(f"-> EXITO: {pqr_nurc}")
                 
-            except Exception:
-                print(f"-> AVISO: No se capturó contenido para {pqr_nurc}")
+            except Exception as e:
+                print(f"-> AVISO: No se capturaron datos para {pqr_nurc}")
+                # Guardamos captura para verificar qué falló visualmente
                 driver.save_screenshot(f"debug_{pqr_nurc}.png")
-                df.iat[index, target_col] = "Sin informacion o error de carga asincrona"
+                df.iat[index, target_col] = "Sin datos (Revisar captura de pantalla)"
             
-            time.sleep(2)
+            # Pausa para no saturar el servidor
+            time.sleep(3)
 
         # Guardar archivo final
         df.to_excel("Reclamos_scraping.xlsx", index=False, engine='openpyxl')
-        print("Proceso finalizado con exito.")
+        print("Proceso completado. Archivo generado: Reclamos_scraping.xlsx")
 
     except Exception as e:
-        print(f"Error fatal: {e}")
-        driver.save_screenshot("error_critico.png")
+        print(f"Error general: {e}")
+        driver.save_screenshot("error_fatal.png")
         raise
     finally:
         driver.quit()
