@@ -27,7 +27,7 @@ jobs:
       env:
         PQRD_USER: ${{ secrets.PQRD_USER }}
         PQRD_PASS: ${{ secrets.PQRD_PASS }}
-      run: python scraper.py
+      run: Web Scraping.py
 
     - name: Guardar Excel como Artifact
       uses: actions/upload-artifact@v4
