@@ -7,7 +7,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
-# Configuración de Chrome optimizada
+# Configuración de Chrome optimizada para GitHub Actions
 chrome_options = Options()
 chrome_options.add_argument("--headless")
 chrome_options.add_argument("--no-sandbox")
@@ -24,20 +24,16 @@ def run_scraper():
 
     try:
         # --- PASO 1: Login ---
-        print("Accediendo a SuperArgo...")
+        print("Iniciando sesión en SuperArgo...")
         driver.get("https://pqrdsuperargo.supersalud.gov.co/login")
         
         wait.until(EC.presence_of_element_located((By.ID, "user"))).send_keys(user)
         driver.find_element(By.ID, "password").send_keys(password)
-
-        # Click en INGRESAR
-        boton_js = "var btn = document.querySelector('button.mat-flat-button'); if(btn) btn.click();"
-        driver.execute_script(boton_js)
+        driver.execute_script("document.querySelector('button.mat-flat-button').click();")
         time.sleep(10)
 
-        # --- PASO 2: Lectura de Excel (Solución Redondeo) ---
+        # --- PASO 2: Lectura de Excel ---
         file_path = "Reclamos.xlsx"
-        # Forzamos lectura como string para evitar el redondeo de los NURC
         df = pd.read_excel(file_path, engine='openpyxl', dtype=str)
 
         # Asegurar columna DG (índice 110)
@@ -48,47 +44,53 @@ def run_scraper():
 
         # --- PASO 3: Bucle de Extracción ---
         for index, row in df.iterrows():
-            # Limpieza de NURC para evitar notación científica y decimales
             pqr_nurc = str(row.iloc[5]).strip().split('.')[0]
             
             if not pqr_nurc or pqr_nurc == 'nan' or pqr_nurc == '':
                 break
                 
             url_reclamo = f"https://pqrdsuperargo.supersalud.gov.co/gestion/supervisar/{pqr_nurc}"
-            print(f"Procesando NURC: {pqr_nurc}")
+            print(f"Abriendo NURC: {pqr_nurc}")
             driver.get(url_reclamo)
             
             try:
-                # NUEVO SELECTOR: Basado en tu hallazgo del HTML
-                # Esperamos específicamente al componente <app-follow>
-                selector_follow = "app-follow"
-                wait.until(EC.visibility_of_element_located((By.TAG_NAME, selector_follow)))
+                # SELECTOR PROFUNDO PROPORCIONADO
+                selector_css = "#contenido > div > div:nth-child(1) > div > mat-card:nth-child(3) > app-follow > mat-card-content"
                 
-                # Pausa extra para que Angular termine de llenar la tabla dentro del componente
-                time.sleep(7)
+                # Esperar a que el contenedor esté presente
+                wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, selector_css)))
                 
-                # Intentamos extraer del componente app-follow
-                elemento_seguimiento = driver.find_element(By.TAG_NAME, selector_follow)
-                texto_extraido = elemento_seguimiento.text.strip()
+                # Pausa para renderizado de Angular (importante para que el texto aparezca)
+                time.sleep(8)
+                
+                # Intentamos extraer el texto directamente
+                elemento = driver.find_element(By.CSS_SELECTOR, selector_css)
+                texto_extraido = elemento.text.strip()
 
-                # Si app-follow está vacío, intentamos con el selector jerárquico que encontraste
-                if len(texto_extraido) < 10:
-                    selector_css = "#contenido > div > div:nth-child(1) > div > mat-card:nth-child(3) > app-follow"
-                    texto_extraido = driver.find_element(By.CSS_SELECTOR, selector_css).text.strip()
+                # Si el texto directo falla, buscamos tablas o divs internos (capas más profundas)
+                if len(texto_extraido) < 5:
+                    print(f"Buscando capas más profundas para {pqr_nurc}...")
+                    # Buscamos cualquier tabla o contenido de texto dentro del mat-card-content
+                    inner_content = driver.execute_script(f"return document.querySelector('{selector_css}').innerText;")
+                    texto_extraido = inner_content.strip() if inner_content else ""
 
                 df.iat[index, target_col] = texto_extraido
-                print(f"-> EXITO: {pqr_nurc} (Datos capturados)")
                 
-            except Exception:
-                print(f"-> AVISO: No se encontro contenido en app-follow para {pqr_nurc}")
+                if len(texto_extraido) > 10:
+                    print(f"-> ÉXITO: {pqr_nurc} ({len(texto_extraido)} caracteres extraídos)")
+                else:
+                    print(f"-> AVISO: {pqr_nurc} extraído pero parece vacío.")
+
+            except Exception as e:
+                print(f"-> ERROR en NURC {pqr_nurc}: {e}")
                 driver.save_screenshot(f"debug_{pqr_nurc}.png")
-                df.iat[index, target_col] = "Sin informacion encontrada en el componente de seguimiento"
+                df.iat[index, target_col] = "Error de localización de elemento"
             
             time.sleep(2)
 
-        # Guardar archivo final
+        # Guardar resultados
         df.to_excel("Reclamos_scraping.xlsx", index=False, engine='openpyxl')
-        print("Proceso finalizado con exito.")
+        print("Archivo Reclamos_scraping.xlsx generado.")
 
     finally:
         driver.quit()
