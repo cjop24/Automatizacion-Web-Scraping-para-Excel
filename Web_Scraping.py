@@ -36,9 +36,11 @@ def run_scraper():
         wait.until(EC.url_contains("/inicio"))
         logging.info("✅ Login exitoso.")
 
-        # CARGA DE EXCEL
+        # --- CARGA CRÍTICA: Forzamos STRING para evitar redondeos ---
         file_input = "Reclamos.xlsx"
-        df = pd.read_excel(file_input, engine='openpyxl') # Quitamos dtype=str aquí para manejarlo manual
+        # Leemos TODO como string para que las columnas F, J, L, M, W, Y, Z, BH, CN no se alteren
+        df = pd.read_excel(file_input, engine='openpyxl', dtype=str) 
+        
         col_name = "Seguimiento_Extraido"
         
         # Asegurar columna DG (110)
@@ -47,42 +49,33 @@ def run_scraper():
                 df[f"Col_Extra_{len(df.columns)}"] = ""
         df.columns.values[110] = col_name
 
-        # Convertir columna de NURC (índice 5) a string limpio sin .0
-        def clean_nurc(val):
-            if pd.isna(val): return ""
-            s = str(val).strip()
-            if s.endswith('.0'): s = s[:-2]
-            return s
-
-        # Identificar pendientes
-        df[col_name] = df[col_name].fillna("")
-        mask_pendientes = (df[col_name] == "")
-        indices_pendientes = df.index[mask_pendientes].tolist()
+        # Limpiar la columna de seguimiento para identificar pendientes
+        df[col_name] = df[col_name].fillna("").strip() if hasattr(df[col_name], 'str') else df[col_name].fillna("")
+        indices_pendientes = df.index[df[col_name] == ""].tolist()
         
         total_a_procesar = min(len(indices_pendientes), LIMITE_BATCH)
-        logging.info(f"Registros pendientes totales: {len(indices_pendientes)}")
+        logging.info(f"Registros pendientes: {len(indices_pendientes)}")
         
         contador = 0
         for idx in indices_pendientes:
             if contador >= LIMITE_BATCH: break
             
-            # Obtener NURC de la columna 6 (índice 5)
-            pqr_nurc = clean_nurc(df.iloc[idx, 5])
+            # Obtener NURC (Columna F -> Índice 5) de forma segura
+            pqr_nurc = str(df.iloc[idx, 5]).strip().split('.')[0]
             
-            if not pqr_nurc or pqr_nurc == "":
-                logging.warning(f"Fila {idx}: NURC vacío, saltando.")
+            if not pqr_nurc or pqr_nurc == 'nan' or pqr_nurc == "":
                 continue
             
-            logging.info(f"Procesando [{contador+1}/{total_a_procesar}] - NURC: {pqr_nurc}")
+            logging.info(f"[{contador+1}/{total_a_procesar}] Procesando NURC: {pqr_nurc}")
             driver.get(f"https://pqrdsuperargo.supersalud.gov.co/gestion/supervisar/{pqr_nurc}")
             
             resultado = "Sin registros"
             try:
-                # Espera inteligente corta
-                time.sleep(5) 
+                # Espera de renderizado
+                time.sleep(6) 
                 script_js = """
                 let table = document.querySelector('app-list-seguimientos table');
-                if (!table) return "TABLA_NO_ENCONTRADA";
+                if (!table) return null;
                 let rows = table.querySelectorAll('tbody tr');
                 if (rows.length > 0 && !rows[0].innerText.includes('No hay datos')) {
                     return Array.from(rows).map(r => {
@@ -95,20 +88,20 @@ def run_scraper():
                 """
                 res = driver.execute_script(script_js)
                 if res: resultado = res
-            except Exception as e:
-                resultado = f"Error: {str(e)[:30]}"
+            except:
+                resultado = "Error en extracción"
 
             df.at[idx, col_name] = resultado
             contador += 1
             
-            # Guardado preventivo cada 20 registros por si falla la conexión
-            if contador % 20 == 0:
+            # Guardado preventivo
+            if contador % 25 == 0:
                 df.to_excel("Reclamos.xlsx", index=False)
 
-        # Guardado final
+        # Guardado final preservando el formato texto
         df.to_excel("Reclamos.xlsx", index=False)
         df.to_excel("Reclamos_scraping.xlsx", index=False)
-        logging.info(f"✅ Proceso terminado. Procesados: {contador}")
+        logging.info(f"✅ Proceso terminado. Total: {contador}")
 
     finally:
         driver.quit()
