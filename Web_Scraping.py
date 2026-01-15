@@ -1,108 +1,113 @@
 import os
 import pandas as pd
 import time
+import logging
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
-chrome_options = Options()
-chrome_options.add_argument("--headless=new")
-chrome_options.add_argument("--no-sandbox")
-chrome_options.add_argument("--disable-dev-shm-usage")
-chrome_options.add_argument("--window-size=1920,1080")
-chrome_options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+# --- Configuración de Logging ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
+# --- Configuración de Chrome (Basada en tu script funcional) ---
+options = Options()
+options.add_argument("--headless=new")
+options.add_argument("--no-sandbox")
+options.add_argument("--disable-dev-shm-usage")
+options.add_argument("--window-size=1920,1080")
 
 def run_scraper():
+    # Credenciales desde Secrets
     user = os.getenv("PQRD_USER")
     password = os.getenv("PQRD_PASS")
     
-    driver = webdriver.Chrome(options=chrome_options)
-    wait = WebDriverWait(driver, 50)
+    driver = webdriver.Chrome(options=options)
+    wait = WebDriverWait(driver, 30)
+
+    def safe_click(locator, timeout=25):
+        el = WebDriverWait(driver, timeout).until(EC.element_to_be_clickable(locator))
+        el.click()
+        return el
 
     try:
-        # --- LOGIN ---
-        print("Iniciando sesión...")
+        logging.info("--- Iniciando Sesión (Lógica Verificada) ---")
         driver.get("https://pqrdsuperargo.supersalud.gov.co/login")
         
+        # Proceso de Login exacto al que te funciona
         wait.until(EC.presence_of_element_located((By.ID, "user"))).send_keys(user)
         driver.find_element(By.ID, "password").send_keys(password)
         
-        driver.execute_script("""
-            let btn = Array.from(document.querySelectorAll('button')).find(b => b.innerText.includes('INGRESAR'));
-            if(btn) btn.click();
-        """)
+        safe_click((By.XPATH, "//button[contains(., 'INGRESAR')]"))
         
-        # VERIFICACIÓN DE LOGIN EXITOSO
-        try:
-            wait.until(EC.presence_of_element_located((By.TAG_NAME, "mat-sidenav-container")))
-            print("Login exitoso.")
-        except:
-            print("Error: El login falló o la página no cargó el dashboard.")
-            driver.save_screenshot("error_login.png")
-            return
+        # Espera crítica para confirmar entrada
+        wait.until(EC.url_contains("/inicio"))
+        logging.info("✅ Login exitoso detectado.")
 
-        # --- EXCEL ---
+        # --- Lectura de Excel ---
         file_path = "Reclamos.xlsx"
         df = pd.read_excel(file_path, engine='openpyxl', dtype=str)
         col_name = "Seguimiento_Extraido"
+        
+        # Asegurar columna DG (índice 110)
         if len(df.columns) <= 110:
-            for i in range(len(df.columns), 111): df[f"C_{i}"] = ""
+            for i in range(len(df.columns), 111):
+                df[f"Col_Temp_{i}"] = ""
         df.columns.values[110] = col_name
 
-        # --- EXTRACCIÓN ---
+        # --- Bucle de Extracción ---
         for index, row in df.iterrows():
             pqr_nurc = str(row.iloc[5]).strip().split('.')[0]
             if not pqr_nurc or pqr_nurc == 'nan': continue
                 
-            print(f"Abriendo NURC: {pqr_nurc}")
+            logging.info(f"Procesando NURC: {pqr_nurc}")
             driver.get(f"https://pqrdsuperargo.supersalud.gov.co/gestion/supervisar/{pqr_nurc}")
             
-            # Forzar zoom out para ver todo el contenido
-            driver.execute_script("document.body.style.zoom='70%'")
-            
             try:
-                # Esperamos a cualquier componente que indique que la página cargó
-                wait.until(EC.presence_of_element_located((By.TAG_NAME, "mat-card")))
-                time.sleep(10)
+                # Esperar al componente visual identificado en el OuterHTML
+                wait.until(EC.presence_of_element_located((By.TAG_NAME, "app-list-seguimientos")))
+                time.sleep(12) # Tiempo para que Angular cargue los datos internos
                 
-                # SCRIPT DINÁMICO: Busca la tabla por etiqueta O por cualquier tabla que exista
+                # Extracción quirúrgica de la tabla y los divs de descripción
                 script_js = """
-                let tabla = document.querySelector('app-list-seguimientos table') || document.querySelector('table');
-                if (!tabla) return "";
-                
+                let filas = document.querySelectorAll('app-list-seguimientos table tbody tr');
                 let logs = [];
-                let filas = tabla.querySelectorAll('tbody tr');
                 filas.forEach(f => {
                     let c = f.querySelectorAll('td');
                     if (c.length >= 4 && !f.innerText.includes('No hay datos')) {
-                        let desc = c[3].querySelector('div') ? c[3].querySelector('div').innerText : c[3].innerText;
-                        logs.push(`[${c[0].innerText.trim()}]: ${desc.trim()}`);
+                        let fecha = c[0].innerText.trim();
+                        let divDesc = c[3].querySelector('div');
+                        let textoDesc = divDesc ? divDesc.innerText.trim() : c[3].innerText.trim();
+                        logs.push(`[${fecha}]: ${textoDesc}`);
                     }
                 });
                 return logs.join('\\n---\\n');
                 """
                 
-                resultado = ""
-                for _ in range(10): # Reintentos internos
-                    resultado = driver.execute_script(script_js)
-                    if resultado: break
-                    time.sleep(2)
-                
-                df.at[index, col_name] = resultado if resultado else "Sin registros visibles"
-                print(f"-> Captura finalizada.")
+                resultado = driver.execute_script(script_js)
+                df.at[index, col_name] = resultado if resultado else "Sin seguimientos"
+                logging.info(f"-> Capturado con éxito para {pqr_nurc}")
 
             except Exception as e:
-                print(f"-> No se detectó la tabla para {pqr_nurc}")
-                df.at[index, col_name] = "Componente no cargó"
-                driver.save_screenshot(f"fallo_{pqr_nurc}.png")
+                logging.warning(f"-> No se encontró tabla en {pqr_nurc}")
+                df.at[index, col_name] = "Error: Tabla no cargó"
+                driver.save_screenshot(f"error_{pqr_nurc}.png")
             
             time.sleep(2)
 
+        # Guardado final
         df.to_excel("Reclamos_scraping.xlsx", index=False)
-        print("Fin.")
+        logging.info("--- Proceso Finalizado con Éxito ---")
 
+    except Exception as e:
+        logging.error(f"Falla crítica: {e}")
+        driver.save_screenshot("DEBUG_FINAL.png")
+        raise
     finally:
         driver.quit()
 
