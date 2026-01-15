@@ -8,7 +8,6 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
-# Configuración de Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 def get_driver():
@@ -17,23 +16,18 @@ def get_driver():
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--window-size=1920,1080")
-    options.add_argument("--disable-gpu")
-    # No cargar imágenes para máxima velocidad
     options.add_experimental_option("prefs", {"profile.managed_default_content_settings.images": 2})
     return webdriver.Chrome(options=options)
 
 def run_scraper():
     user = os.getenv("PQRD_USER")
     password = os.getenv("PQRD_PASS")
-    
-    # LÍMITE DE PROCESAMIENTO POR SESIÓN
     LIMITE_BATCH = 1000 
     
     driver = get_driver()
     wait = WebDriverWait(driver, 20)
 
     try:
-        # --- LOGIN ---
         logging.info("Iniciando sesión...")
         driver.get("https://pqrdsuperargo.supersalud.gov.co/login")
         wait.until(EC.visibility_of_element_located((By.ID, "user"))).send_keys(user)
@@ -42,71 +36,79 @@ def run_scraper():
         wait.until(EC.url_contains("/inicio"))
         logging.info("✅ Login exitoso.")
 
-        # --- CARGA DE EXCEL ---
+        # CARGA DE EXCEL
         file_input = "Reclamos.xlsx"
-        df = pd.read_excel(file_input, engine='openpyxl', dtype=str)
+        df = pd.read_excel(file_input, engine='openpyxl') # Quitamos dtype=str aquí para manejarlo manual
         col_name = "Seguimiento_Extraido"
         
+        # Asegurar columna DG (110)
         if len(df.columns) <= 110:
-            for i in range(len(df.columns), 111): df[f"C_{i}"] = ""
+            while len(df.columns) <= 110:
+                df[f"Col_Extra_{len(df.columns)}"] = ""
         df.columns.values[110] = col_name
 
-        # --- FILTRADO: Solo procesar lo que esté vacío ---
-        # Esto permite retomar el trabajo si se corta o si procesamos por lotes
-        pendientes = df[df[col_name].isna() | (df[col_name] == "")]
-        total_a_procesar = min(len(pendientes), LIMITE_BATCH)
-        
-        logging.info(f"Registros pendientes totales: {len(pendientes)}")
-        logging.info(f"Procesando lote de: {total_a_procesar} registros")
+        # Convertir columna de NURC (índice 5) a string limpio sin .0
+        def clean_nurc(val):
+            if pd.isna(val): return ""
+            s = str(val).strip()
+            if s.endswith('.0'): s = s[:-2]
+            return s
 
+        # Identificar pendientes
+        df[col_name] = df[col_name].fillna("")
+        mask_pendientes = (df[col_name] == "")
+        indices_pendientes = df.index[mask_pendientes].tolist()
+        
+        total_a_procesar = min(len(indices_pendientes), LIMITE_BATCH)
+        logging.info(f"Registros pendientes totales: {len(indices_pendientes)}")
+        
         contador = 0
-        for index, row in pendientes.iterrows():
+        for idx in indices_pendientes:
             if contador >= LIMITE_BATCH: break
             
-            pqr_nurc = str(row.iloc[5]).strip().split('.')[0]
-            if not pqr_nurc or pqr_nurc == 'nan': continue
+            # Obtener NURC de la columna 6 (índice 5)
+            pqr_nurc = clean_nurc(df.iloc[idx, 5])
             
+            if not pqr_nurc or pqr_nurc == "":
+                logging.warning(f"Fila {idx}: NURC vacío, saltando.")
+                continue
+            
+            logging.info(f"Procesando [{contador+1}/{total_a_procesar}] - NURC: {pqr_nurc}")
             driver.get(f"https://pqrdsuperargo.supersalud.gov.co/gestion/supervisar/{pqr_nurc}")
             
+            resultado = "Sin registros"
             try:
-                # Extracción atómica por JS (Paciencia de 8 seg)
+                # Espera inteligente corta
+                time.sleep(5) 
                 script_js = """
-                return (function() {
-                    let table = document.querySelector('app-list-seguimientos table');
-                    if (!table) return null;
-                    let rows = table.querySelectorAll('tbody tr');
-                    if (rows.length > 0 && !rows[0].innerText.includes('No hay datos')) {
-                        return Array.from(rows).map(r => {
-                            let c = r.querySelectorAll('td');
-                            let d = c[3].querySelector('div') ? c[3].querySelector('div').innerText : c[3].innerText;
-                            return `[${c[0].innerText.trim()}]: ${d.trim()}`;
-                        }).join('\\n---\\n');
-                    }
-                    return "SIN_REGISTROS";
-                })();
+                let table = document.querySelector('app-list-seguimientos table');
+                if (!table) return "TABLA_NO_ENCONTRADA";
+                let rows = table.querySelectorAll('tbody tr');
+                if (rows.length > 0 && !rows[0].innerText.includes('No hay datos')) {
+                    return Array.from(rows).map(r => {
+                        let c = r.querySelectorAll('td');
+                        let d = c[3] ? (c[3].querySelector('div') ? c[3].querySelector('div').innerText : c[3].innerText) : "";
+                        return `[${c[0].innerText.trim()}]: ${d.trim()}`;
+                    }).join('\\n-----\\n');
+                }
+                return "SIN_SEGUIMIENTO";
                 """
-                
-                resultado = "Sin registros"
-                for _ in range(4): # 4 reintentos de 2 segundos cada uno
-                    res = driver.execute_script(script_js)
-                    if res and res != "SIN_REGISTROS":
-                        resultado = res
-                        break
-                    time.sleep(2)
+                res = driver.execute_script(script_js)
+                if res: resultado = res
+            except Exception as e:
+                resultado = f"Error: {str(e)[:30]}"
 
-                df.at[index, col_name] = resultado
-                contador += 1
-                if contador % 50 == 0:
-                    logging.info(f"Progreso: {contador}/{total_a_procesar}")
+            df.at[idx, col_name] = resultado
+            contador += 1
+            
+            # Guardado preventivo cada 20 registros por si falla la conexión
+            if contador % 20 == 0:
+                df.to_excel("Reclamos.xlsx", index=False)
 
-            except Exception:
-                df.at[index, col_name] = "Error de carga"
-
-        # Guardar el mismo archivo para "recordar" el progreso
+        # Guardado final
         df.to_excel("Reclamos.xlsx", index=False)
-        # También guardar una copia con el nombre de salida para GitHub Artifacts
         df.to_excel("Reclamos_scraping.xlsx", index=False)
-        logging.info(f"✅ Lote completado. {contador} registros procesados.")
+        logging.info(f"✅ Proceso terminado. Procesados: {contador}")
 
     finally:
         driver.quit()
