@@ -4,110 +4,110 @@ import time
 import logging
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
-# --- Configuración de Logging ---
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+# Configuración de Logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# --- Configuración de Chrome (Basada en tu script funcional) ---
-options = Options()
-options.add_argument("--headless=new")
-options.add_argument("--no-sandbox")
-options.add_argument("--disable-dev-shm-usage")
-options.add_argument("--window-size=1920,1080")
+def get_driver():
+    options = Options()
+    options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--window-size=1920,1080")
+    options.add_argument("--disable-gpu")
+    # No cargar imágenes para máxima velocidad
+    options.add_experimental_option("prefs", {"profile.managed_default_content_settings.images": 2})
+    return webdriver.Chrome(options=options)
 
 def run_scraper():
-    # Credenciales desde Secrets
     user = os.getenv("PQRD_USER")
     password = os.getenv("PQRD_PASS")
     
-    driver = webdriver.Chrome(options=options)
-    wait = WebDriverWait(driver, 30)
-
-    def safe_click(locator, timeout=25):
-        el = WebDriverWait(driver, timeout).until(EC.element_to_be_clickable(locator))
-        el.click()
-        return el
+    # LÍMITE DE PROCESAMIENTO POR SESIÓN
+    LIMITE_BATCH = 1000 
+    
+    driver = get_driver()
+    wait = WebDriverWait(driver, 20)
 
     try:
-        logging.info("--- Iniciando Sesión (Lógica Verificada) ---")
+        # --- LOGIN ---
+        logging.info("Iniciando sesión...")
         driver.get("https://pqrdsuperargo.supersalud.gov.co/login")
-        
-        # Proceso de Login exacto al que te funciona
-        wait.until(EC.presence_of_element_located((By.ID, "user"))).send_keys(user)
+        wait.until(EC.visibility_of_element_located((By.ID, "user"))).send_keys(user)
         driver.find_element(By.ID, "password").send_keys(password)
-        
-        safe_click((By.XPATH, "//button[contains(., 'INGRESAR')]"))
-        
-        # Espera crítica para confirmar entrada
+        driver.execute_script("Array.from(document.querySelectorAll('button')).find(b => b.innerText.includes('INGRESAR')).click();")
         wait.until(EC.url_contains("/inicio"))
-        logging.info("✅ Login exitoso detectado.")
+        logging.info("✅ Login exitoso.")
 
-        # --- Lectura de Excel ---
-        file_path = "Reclamos.xlsx"
-        df = pd.read_excel(file_path, engine='openpyxl', dtype=str)
+        # --- CARGA DE EXCEL ---
+        file_input = "Reclamos.xlsx"
+        df = pd.read_excel(file_input, engine='openpyxl', dtype=str)
         col_name = "Seguimiento_Extraido"
         
-        # Asegurar columna DG (índice 110)
         if len(df.columns) <= 110:
-            for i in range(len(df.columns), 111):
-                df[f"Col_Temp_{i}"] = ""
+            for i in range(len(df.columns), 111): df[f"C_{i}"] = ""
         df.columns.values[110] = col_name
 
-        # --- Bucle de Extracción ---
-        for index, row in df.iterrows():
+        # --- FILTRADO: Solo procesar lo que esté vacío ---
+        # Esto permite retomar el trabajo si se corta o si procesamos por lotes
+        pendientes = df[df[col_name].isna() | (df[col_name] == "")]
+        total_a_procesar = min(len(pendientes), LIMITE_BATCH)
+        
+        logging.info(f"Registros pendientes totales: {len(pendientes)}")
+        logging.info(f"Procesando lote de: {total_a_procesar} registros")
+
+        contador = 0
+        for index, row in pendientes.iterrows():
+            if contador >= LIMITE_BATCH: break
+            
             pqr_nurc = str(row.iloc[5]).strip().split('.')[0]
             if not pqr_nurc or pqr_nurc == 'nan': continue
-                
-            logging.info(f"Procesando NURC: {pqr_nurc}")
+            
             driver.get(f"https://pqrdsuperargo.supersalud.gov.co/gestion/supervisar/{pqr_nurc}")
             
             try:
-                # Esperar al componente visual identificado en el OuterHTML
-                wait.until(EC.presence_of_element_located((By.TAG_NAME, "app-list-seguimientos")))
-                time.sleep(12) # Tiempo para que Angular cargue los datos internos
-                
-                # Extracción quirúrgica de la tabla y los divs de descripción
+                # Extracción atómica por JS (Paciencia de 8 seg)
                 script_js = """
-                let filas = document.querySelectorAll('app-list-seguimientos table tbody tr');
-                let logs = [];
-                filas.forEach(f => {
-                    let c = f.querySelectorAll('td');
-                    if (c.length >= 4 && !f.innerText.includes('No hay datos')) {
-                        let fecha = c[0].innerText.trim();
-                        let divDesc = c[3].querySelector('div');
-                        let textoDesc = divDesc ? divDesc.innerText.trim() : c[3].innerText.trim();
-                        logs.push(`[${fecha}]: ${textoDesc}`);
+                return (function() {
+                    let table = document.querySelector('app-list-seguimientos table');
+                    if (!table) return null;
+                    let rows = table.querySelectorAll('tbody tr');
+                    if (rows.length > 0 && !rows[0].innerText.includes('No hay datos')) {
+                        return Array.from(rows).map(r => {
+                            let c = r.querySelectorAll('td');
+                            let d = c[3].querySelector('div') ? c[3].querySelector('div').innerText : c[3].innerText;
+                            return `[${c[0].innerText.trim()}]: ${d.trim()}`;
+                        }).join('\\n---\\n');
                     }
-                });
-                return logs.join('\\n---\\n');
+                    return "SIN_REGISTROS";
+                })();
                 """
                 
-                resultado = driver.execute_script(script_js)
-                df.at[index, col_name] = resultado if resultado else "Sin seguimientos"
-                logging.info(f"-> Capturado con éxito para {pqr_nurc}")
+                resultado = "Sin registros"
+                for _ in range(4): # 4 reintentos de 2 segundos cada uno
+                    res = driver.execute_script(script_js)
+                    if res and res != "SIN_REGISTROS":
+                        resultado = res
+                        break
+                    time.sleep(2)
 
-            except Exception as e:
-                logging.warning(f"-> No se encontró tabla en {pqr_nurc}")
-                df.at[index, col_name] = "Error: Tabla no cargó"
-                driver.save_screenshot(f"error_{pqr_nurc}.png")
-            
-            time.sleep(2)
+                df.at[index, col_name] = resultado
+                contador += 1
+                if contador % 50 == 0:
+                    logging.info(f"Progreso: {contador}/{total_a_procesar}")
 
-        # Guardado final
+            except Exception:
+                df.at[index, col_name] = "Error de carga"
+
+        # Guardar el mismo archivo para "recordar" el progreso
+        df.to_excel("Reclamos.xlsx", index=False)
+        # También guardar una copia con el nombre de salida para GitHub Artifacts
         df.to_excel("Reclamos_scraping.xlsx", index=False)
-        logging.info("--- Proceso Finalizado con Éxito ---")
+        logging.info(f"✅ Lote completado. {contador} registros procesados.")
 
-    except Exception as e:
-        logging.error(f"Falla crítica: {e}")
-        driver.save_screenshot("DEBUG_FINAL.png")
-        raise
     finally:
         driver.quit()
 
